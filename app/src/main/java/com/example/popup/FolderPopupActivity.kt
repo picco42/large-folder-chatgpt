@@ -40,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
+import java.util.function.Consumer
 
 class FolderPopupActivity : ComponentActivity() {
 
@@ -63,6 +64,9 @@ class FolderPopupActivity : ComponentActivity() {
     private var hasFinished = false
     private var isPopupComposed = false
     private val blurInterceptor = WindowBlurLifecycleInterceptor()
+    private val crossWindowBlurEnabledListener = Consumer<Boolean> { enabled ->
+        updateSystemBlurAvailability(enabled)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,8 +88,7 @@ class FolderPopupActivity : ComponentActivity() {
         PopupSessionCoordinator.registerActivePopup(this)
 
         maxWindowBlurRadiusPx = FolderBlurSpec.maxBlurRadiusPx(Density(this))
-        // Popup mode uses a clean edge-to-edge dimmed Compose scrim instead of cross-window blur
-        isSystemBlurEnabledState = false
+        refreshSystemBlurAvailability()
 
         if (savedInstanceState != null) {
             if (savedInstanceState.getBoolean(STATE_AWAITING_APP_RETURN, false)) {
@@ -106,6 +109,7 @@ class FolderPopupActivity : ComponentActivity() {
             apiLevel = Build.VERSION.SDK_INT
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            windowManager.addCrossWindowBlurEnabledListener(mainExecutor, crossWindowBlurEnabledListener)
             applyWindowBackgroundBlur(0)
         }
 
@@ -388,7 +392,7 @@ class FolderPopupActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         IconStyleManager.syncPaletteAndRefreshIfNeeded(this, triggerWidgetUpdate = true)
-        isSystemBlurEnabledState = false
+        refreshSystemBlurAvailability()
     }
 
     override fun onUserLeaveHint() {
@@ -408,10 +412,27 @@ class FolderPopupActivity : ComponentActivity() {
     override fun onDestroy() {
         PopupSessionCoordinator.unregisterPopup(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            windowManager.removeCrossWindowBlurEnabledListener(crossWindowBlurEnabledListener)
             applyWindowBackgroundBlur(0)
         }
         blurInterceptor.endSession("DESTROY")
         super.onDestroy()
+    }
+
+    private fun refreshSystemBlurAvailability() {
+        val enabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            windowManager.isCrossWindowBlurEnabled
+        updateSystemBlurAvailability(enabled)
+    }
+
+    private fun updateSystemBlurAvailability(enabled: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        if (isSystemBlurEnabledState == enabled) return
+
+        isSystemBlurEnabledState = enabled
+        // Force the interceptor to re-apply the current animation value after a system toggle.
+        lastAppliedBlurRadiusPx = -1
+        applyWindowBackgroundBlur((lastBlurProgress * maxWindowBlurRadiusPx).roundToInt())
     }
 
     private fun configureTranslucentBlurWindow() {
@@ -435,20 +456,25 @@ class FolderPopupActivity : ComponentActivity() {
         }
     }
 
-    private fun commitRawWindowBackgroundBlur(@Suppress("UNUSED_PARAMETER") clampedPx: Int) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val lp = window.attributes
-            val blurAndDimMask =
-                WindowManager.LayoutParams.FLAG_BLUR_BEHIND or WindowManager.LayoutParams.FLAG_DIM_BEHIND
-            val clearedFlags = lp.flags and blurAndDimMask.inv()
-            if (lp.flags != clearedFlags || lp.blurBehindRadius != 0 || lp.dimAmount != 0f) {
-                lp.flags = clearedFlags
-                lp.blurBehindRadius = 0
-                lp.dimAmount = 0f
-                window.attributes = lp
-            }
-            window.setBackgroundBlurRadius(0)
+    private fun commitRawWindowBackgroundBlur(radiusPx: Int) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+
+        val safeRadius = if (windowManager.isCrossWindowBlurEnabled) {
+            radiusPx.coerceIn(0, maxWindowBlurRadiusPx)
+        } else {
+            0
         }
+        val lp = window.attributes
+        val blurFlag = WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+        val nextFlags = if (safeRadius > 0) lp.flags or blurFlag else lp.flags and blurFlag.inv()
+        if (lp.flags != nextFlags || lp.blurBehindRadius != safeRadius || lp.dimAmount != 0f) {
+            lp.flags = nextFlags
+            lp.blurBehindRadius = safeRadius
+            lp.dimAmount = 0f
+            window.attributes = lp
+        }
+        // This popup blurs the content behind its translucent window, not its own background.
+        window.setBackgroundBlurRadius(0)
     }
 
     internal fun commitWindowBlurForTesting(radiusPx: Int, systemBlurEnabled: Boolean) {
